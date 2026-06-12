@@ -471,6 +471,9 @@ def move_to_review(torrent: dict, cfg: dict, dry_run: bool) -> bool:
     if not review:
         return False
     src = Path(map_qbt_path(torrent["content_path"], cfg))
+    if src == Path(cfg["LOCAL_DOWNLOADS_DIR"].rstrip("/")):
+        # multifile torrent without a root folder: content_path == save_path
+        raise RuntimeError("refusing to move the downloads root to needs_review")
     if not src.exists():
         raise RuntimeError(f"content path missing: {src}")
     dst = unique_dest(Path(review) / sanitize_component(torrent["name"]))
