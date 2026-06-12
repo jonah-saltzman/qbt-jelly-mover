@@ -202,6 +202,8 @@ Rules:
 - For media_type "other": library_folder is "" and moves is []; junk stays [].
 - confidence: "low" if unsure about the classification or the naming,
   otherwise "high".
+- If you are not confident of the canonical title or release year, verify
+  with WebSearch before answering. Skip the search when you already know.
 Output JSON only."""
 
 PLAN_SCHEMA = {
@@ -297,7 +299,9 @@ def ask_claude(prompt: str, cfg: dict) -> dict:
         cfg["CLAUDE_BIN"],
         "--model", cfg["CLAUDE_MODEL"],
         "-p",
-        "--tools", "",
+        "--tools", "WebSearch",
+        "--allowedTools", "WebSearch",
+        "--strict-mcp-config",
         "--no-session-persistence",
         "--setting-sources", "",
         "--system-prompt", SYSTEM_PROMPT,
