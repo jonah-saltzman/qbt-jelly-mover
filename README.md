@@ -16,10 +16,18 @@ For each completed torrent it:
 
 Non-media torrents are left stopped in qBittorrent. Low-confidence
 classifications are moved whole into `NEEDS_REVIEW_DIR` for a human to sort
-(or left in place if that setting is empty). All filesystem actions are
-moves; nothing is ever copied-and-kept or deleted. The only "deletion" is
-`rmdir` of the empty folder husk a torrent leaves behind (and that can be
-turned off with `CLEANUP_EMPTY_DIRS=false`).
+(or left in place if that setting is empty).
+
+Junk files (release-group `.txt`/`.nfo`/`.url` notes, sample videos,
+"screens"/"proof" images, checksums) never enter the library: Claude lists
+them separately and they are moved into a per-torrent subfolder of
+`RECYCLE_DIR` (default `<downloads>/.recycle`). The library's `extras/`
+folder is reserved for real bonus content (trailers, featurettes, deleted
+scenes). Empty the recycle bin yourself now and then.
+
+All filesystem actions are moves; nothing is ever copied-and-kept or
+deleted. The only "deletion" is `rmdir` of the empty folder husk a torrent
+leaves behind (and that can be turned off with `CLEANUP_EMPTY_DIRS=false`).
 
 ## Token efficiency
 
@@ -73,6 +81,7 @@ See `env.example` for all settings. Notable:
 |---|---|
 | `QBT_SAVE_PATH_PREFIX` / `LOCAL_DOWNLOADS_DIR` | qBittorrent runs on the NAS, so the API reports NAS paths (`/downloads/...`). These two map them to the local mount (`/mnt/downloads/...`). |
 | `NEEDS_REVIEW_DIR` | Destination for low-confidence media. Empty = leave in downloads and mark failed. |
+| `RECYCLE_DIR` | Junk files are moved here (per-torrent subfolders), never deleted. Empty = `<LOCAL_DOWNLOADS_DIR>/.recycle`, which keeps junk moves on the same NFS export (instant renames). |
 | `QBT_CATEGORY` | Only process torrents in this category. Empty = all. |
 | `MAX_ATTEMPTS` | After this many failures a torrent is parked; delete its entry from `STATE_FILE` to retry. |
 

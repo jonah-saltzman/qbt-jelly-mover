@@ -38,6 +38,9 @@ DEFAULTS = {
     "TV_DIR": "/mnt/jelly/tv",
     # Optional: where low-confidence media goes (empty = leave in downloads).
     "NEEDS_REVIEW_DIR": "",
+    # Junk files (release-group notes, samples, ...) are moved here, never
+    # into the library. Empty = "<LOCAL_DOWNLOADS_DIR>/.recycle".
+    "RECYCLE_DIR": "",
     "POLL_INTERVAL": "60",
     "CLAUDE_BIN": "claude",
     "CLAUDE_MODEL": "sonnet",
@@ -68,6 +71,9 @@ def load_config(env_file: str) -> dict:
             cfg[k] = os.environ[k]
     if not cfg["QBT_API_KEY"]:
         die(f"QBT_API_KEY not set (env file: {env_file})")
+    if not cfg["RECYCLE_DIR"]:
+        cfg["RECYCLE_DIR"] = os.path.join(
+            cfg["LOCAL_DOWNLOADS_DIR"].rstrip("/"), ".recycle")
     return cfg
 
 
@@ -177,18 +183,23 @@ Rules:
 - existing: if one of the provided existing library folders is the SAME
   movie/show, set existing to that name verbatim and use it as library_folder
   (keep its naming as-is, even if unconventional). Otherwise null.
-- moves: every file of the torrent must appear exactly once. "from" must be
-  copied verbatim from the file list. "to" is a path relative to library_folder.
+- junk: extraneous files that do not belong in a media library, listed
+  verbatim from the file list: release-group notes/ads (.txt, .nfo, .url,
+  .exe, .sfv), sample videos, "screens"/"proof" images, checksum files.
+  Junk goes ONLY in "junk", never in moves.
+- moves: every non-junk file of the torrent must appear exactly once. "from"
+  must be copied verbatim from the file list. "to" is a path relative to
+  library_folder.
   - movie: main video file -> "Title (Year).ext". Subtitles ->
-    "Title (Year).<lang>.srt" (omit <lang> if unknown). Posters/fanart/nfo keep
-    standard Jellyfin names (cover.jpg, backdrop.jpg, movie.nfo). Trailers,
-    samples and junk files -> "extras/<original filename>".
+    "Title (Year).<lang>.srt" (omit <lang> if unknown). Genuine artwork keeps
+    standard Jellyfin names (cover.jpg, backdrop.jpg). Real bonus content
+    (trailers, featurettes, deleted scenes) -> "extras/<original filename>".
   - tv: episodes -> "Season 01/Title S01E01.ext" (zero-padded; specials go in
     "Season 00"). Append the episode name when it is evident in the filename:
     "Season 01/Title S01E01 Episode Name.ext". For lecture series/courses,
     number the lectures in their natural order as S01E01, S01E02, ...
-    Subtitles are named like their episode. Junk -> "extras/<original filename>".
-- For media_type "other": library_folder is "" and moves is [].
+    Subtitles are named like their episode.
+- For media_type "other": library_folder is "" and moves is []; junk stays [].
 - confidence: "low" if unsure about the classification or the naming,
   otherwise "high".
 Output JSON only."""
@@ -214,9 +225,10 @@ PLAN_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "junk": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["media_type", "confidence", "title", "year",
-                 "library_folder", "existing", "moves"],
+                 "library_folder", "existing", "moves", "junk"],
     "additionalProperties": False,
 }
 
@@ -346,24 +358,45 @@ def common_root(file_names: list[str]) -> str:
     return ""
 
 
-def validate_plan(plan: dict, file_names: list[str]) -> tuple[str, str, list[tuple[str, str]]]:
-    """Returns (media_type, library_folder, [(from, to), ...]). Raises ValueError."""
+# Extensions that are junk beyond doubt, used when the plan forgets a file.
+JUNK_EXTS = {"txt", "nfo", "url", "lnk", "exe", "sfv", "srr", "md5", "sha",
+             "sha1", "sha256", "torrent", "htm", "html", "website"}
+
+
+def validate_plan(plan: dict, file_names: list[str]
+                  ) -> tuple[str, str, list[tuple[str, str]], list[tuple[str, str]]]:
+    """Returns (media_type, library_folder, moves, junk) where moves and junk
+    are [(from, to), ...] lists. Raises ValueError."""
     media_type = plan["media_type"]
     if media_type == "other":
-        return media_type, "", []
+        return media_type, "", [], []
 
     folder = sanitize_component(plan["library_folder"])
     if not folder or folder == "..":
         raise ValueError(f"bad library_folder: {plan['library_folder']!r}")
 
     known = set(file_names)
-    seen_from, seen_to, moves = set(), set(), []
+    root = common_root(file_names)
+
+    def below_root(src: str) -> str:
+        return src[len(root) + 1:] if root and src.startswith(root + "/") else src
+
+    seen_from, junk = set(), []
+    for src in plan.get("junk", []):
+        if src not in known:
+            raise ValueError(f"plan references unknown file: {src!r}")
+        if src in seen_from:
+            raise ValueError(f"file listed twice: {src!r}")
+        seen_from.add(src)
+        junk.append((src, sanitize_relpath(below_root(src))))
+
+    seen_to, moves = set(), []
     for m in plan["moves"]:
         src = m["from"]
         if src not in known:
             raise ValueError(f"plan references unknown file: {src!r}")
         if src in seen_from:
-            raise ValueError(f"file moved twice: {src!r}")
+            raise ValueError(f"file listed twice: {src!r}")
         seen_from.add(src)
         dst = sanitize_relpath(m["to"])
         if dst.lower() in seen_to:
@@ -371,13 +404,17 @@ def validate_plan(plan: dict, file_names: list[str]) -> tuple[str, str, list[tup
         seen_to.add(dst.lower())
         moves.append((src, dst))
 
-    # Anything Claude forgot still has to leave the downloads folder: stash it
-    # under extras/ preserving its path below the torrent's root folder.
-    root = common_root(file_names)
+    # Anything Claude forgot still has to leave the downloads folder: junk
+    # extensions go to the recycle bin, anything else is stashed in extras/.
     for src in file_names:
         if src in seen_from:
             continue
-        rel = src[len(root) + 1:] if root and src.startswith(root + "/") else src
+        rel = below_root(src)
+        ext = rel.rpartition(".")[2].lower()
+        if ext in JUNK_EXTS:
+            junk.append((src, sanitize_relpath(rel)))
+            log(f"  WARN: plan did not cover {src!r}; recycling")
+            continue
         dst = sanitize_relpath("extras/" + rel)
         while dst.lower() in seen_to:
             stem, dot, ext = dst.rpartition(".")
@@ -385,7 +422,7 @@ def validate_plan(plan: dict, file_names: list[str]) -> tuple[str, str, list[tup
         seen_to.add(dst.lower())
         moves.append((src, dst))
         log(f"  WARN: plan did not cover {src!r}; stashing in extras/")
-    return media_type, folder, moves
+    return media_type, folder, moves, junk
 
 
 def unique_dest(dst: Path) -> Path:
@@ -435,9 +472,11 @@ def remove_empty_dirs(root: Path) -> None:
 
 
 def execute_plan(media_type: str, folder: str, moves: list[tuple[str, str]],
-                 torrent: dict, cfg: dict, dry_run: bool) -> None:
+                 junk: list[tuple[str, str]], torrent: dict, cfg: dict,
+                 dry_run: bool) -> None:
     root = Path(cfg["TV_DIR"] if media_type == "tv" else cfg["MOVIES_DIR"])
     save_local = map_qbt_path(torrent["save_path"], cfg)
+    recycle_base = Path(cfg["RECYCLE_DIR"]) / sanitize_component(torrent["name"])
 
     # Reuse an existing folder that differs only by case, if any.
     dest_base = root / folder
@@ -447,23 +486,26 @@ def execute_plan(media_type: str, folder: str, moves: list[tuple[str, str]],
                 dest_base = root / entry
                 break
 
-    for src_rel, dst_rel in moves:
-        src = save_local / src_rel
-        dst = dest_base / dst_rel
-        if not src.is_file():
-            if dst.exists():  # already moved by an earlier, interrupted attempt
-                log(f"  resume: {dst.name!r} already in place")
-                continue
-            raise RuntimeError(f"source file missing: {src}")
-        if not dry_run:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-        run_mv(src, unique_dest(dst), dry_run)
+    for base, batch in ((dest_base, moves), (recycle_base, junk)):
+        for src_rel, dst_rel in batch:
+            src = save_local / src_rel
+            dst = base / dst_rel
+            if not src.is_file():
+                if dst.exists():  # already moved by an earlier, interrupted attempt
+                    log(f"  resume: {dst.name!r} already in place")
+                    continue
+                raise RuntimeError(f"source file missing: {src}")
+            if not dry_run:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+            run_mv(src, unique_dest(dst), dry_run)
 
     if cfg["CLEANUP_EMPTY_DIRS"].lower() == "true" and not dry_run:
-        top = common_root([m[0] for m in moves])
+        top = common_root([m[0] for m in moves + junk])
         if top:
             remove_empty_dirs(save_local / top)
     log(f"  moved {len(moves)} file(s) -> {dest_base}")
+    if junk:
+        log(f"  recycled {len(junk)} junk file(s) -> {recycle_base}")
 
 
 def move_to_review(torrent: dict, cfg: dict, dry_run: bool) -> bool:
@@ -509,7 +551,7 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
 
     prompt = build_prompt(name, files, library_candidates(name, cfg))
     plan = ask_claude(prompt, cfg)
-    media_type, folder, moves = validate_plan(plan, file_names)
+    media_type, folder, moves, junk = validate_plan(plan, file_names)
 
     if media_type == "other":
         log("  not movie/tv content; leaving torrent stopped in qBittorrent")
@@ -526,7 +568,7 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
             state.set(h, status="failed", name=name, added_on=t.get("added_on"), reason="low confidence")
         return
 
-    execute_plan(media_type, folder, moves, t, cfg, dry_run)
+    execute_plan(media_type, folder, moves, junk, t, cfg, dry_run)
     if dry_run:
         log("  DRY-RUN would remove torrent from qBittorrent")
         return
