@@ -144,6 +144,9 @@ class State:
     def get(self, torrent_hash: str) -> dict:
         return self.data.get(torrent_hash, {})
 
+    def clear(self, torrent_hash: str) -> None:
+        self.data.pop(torrent_hash, None)
+
     def set(self, torrent_hash: str, **fields) -> None:
         entry = self.data.setdefault(torrent_hash, {})
         entry.update(fields, updated=time.strftime("%Y-%m-%dT%H:%M:%S"))
@@ -446,9 +449,12 @@ def execute_plan(media_type: str, folder: str, moves: list[tuple[str, str]],
 
     for src_rel, dst_rel in moves:
         src = save_local / src_rel
-        if not src.is_file():
-            raise RuntimeError(f"source file missing: {src}")
         dst = dest_base / dst_rel
+        if not src.is_file():
+            if dst.exists():  # already moved by an earlier, interrupted attempt
+                log(f"  resume: {dst.name!r} already in place")
+                continue
+            raise RuntimeError(f"source file missing: {src}")
         if not dry_run:
             dst.parent.mkdir(parents=True, exist_ok=True)
         run_mv(src, unique_dest(dst), dry_run)
@@ -492,10 +498,11 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
             qbt.stop(h)
             log("  stopped torrent")
 
-    files = qbt.files(h)
+    # priority 0 = file deselected in qBittorrent: it isn't on disk
+    files = [f for f in qbt.files(h) if f.get("priority", 1) != 0]
     file_names = [f["name"] for f in files]
     if not file_names:
-        raise RuntimeError("torrent has no files")
+        raise RuntimeError("torrent has no downloaded files")
 
     prompt = build_prompt(name, files, library_candidates(name, cfg))
     plan = ask_claude(prompt, cfg)
@@ -503,7 +510,7 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
 
     if media_type == "other":
         log("  not movie/tv content; leaving torrent stopped in qBittorrent")
-        state.set(h, status="skipped", name=name, reason="not media")
+        state.set(h, status="skipped", name=name, added_on=t.get("added_on"), reason="not media")
         return
 
     if plan["confidence"] == "low":
@@ -511,9 +518,9 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
         if move_to_review(t, cfg, dry_run):
             if not dry_run:
                 qbt.remove(h)
-            state.set(h, status="needs_review", name=name)
+            state.set(h, status="needs_review", name=name, added_on=t.get("added_on"))
         else:
-            state.set(h, status="failed", name=name, reason="low confidence")
+            state.set(h, status="failed", name=name, added_on=t.get("added_on"), reason="low confidence")
         return
 
     execute_plan(media_type, folder, moves, t, cfg, dry_run)
@@ -521,7 +528,7 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
         log("  DRY-RUN would remove torrent from qBittorrent")
         return
     qbt.remove(h)
-    state.set(h, status="done", name=name, media_type=media_type, folder=folder)
+    state.set(h, status="done", name=name, added_on=t.get("added_on"), media_type=media_type, folder=folder)
     log(f"  done: removed torrent, library folder {folder!r}")
 
 
@@ -529,7 +536,18 @@ def poll_once(qbt: Qbt, state: State, cfg: dict, dry_run: bool) -> None:
     for t in qbt.completed(cfg["QBT_CATEGORY"]):
         h = t["hash"]
         entry = state.get(h)
-        if entry.get("status") in ("done", "skipped", "needs_review"):
+        if entry and entry.get("added_on") != t.get("added_on"):
+            # Same hash, new download (torrent was re-added): start over.
+            log(f"re-added torrent {t['name']!r}; clearing previous state")
+            state.clear(h)
+            entry = {}
+        if entry.get("status") == "done":
+            # Files are already in the library; only the removal is left.
+            log(f"retrying removal of {t['name']!r}")
+            if not dry_run:
+                qbt.remove(h)
+            continue
+        if entry.get("status") in ("skipped", "needs_review"):
             continue
         attempts = entry.get("attempts", 0)
         if entry.get("status") == "failed" and attempts >= int(cfg["MAX_ATTEMPTS"]):
@@ -541,8 +559,8 @@ def poll_once(qbt: Qbt, state: State, cfg: dict, dry_run: bool) -> None:
         except Exception as e:  # noqa: BLE001 -- keep the daemon alive
             attempts += 1
             log(f"  ERROR ({attempts}/{cfg['MAX_ATTEMPTS']}): {e}")
-            state.set(h, status="failed", name=t["name"], attempts=attempts,
-                      error=str(e)[:300])
+            state.set(h, status="failed", name=t["name"], added_on=t.get("added_on"),
+                      attempts=attempts, error=str(e)[:300])
             if attempts >= int(cfg["MAX_ATTEMPTS"]):
                 log(f"  giving up on {t['name']!r}; will not retry "
                     f"(delete its state entry to retry)")
