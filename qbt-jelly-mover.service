@@ -1,0 +1,16 @@
+[Unit]
+Description=qbt-jelly-mover - move completed torrents into the Jellyfin library
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jonahsaltzman
+ExecStart=/usr/bin/python3 /home/jonahsaltzman/qbt-jelly-mover/mover.py --env /home/jonahsaltzman/qbt-jelly-mover/.env
+Restart=on-failure
+RestartSec=30
+# claude CLI needs $HOME for its credentials
+Environment=HOME=/home/jonahsaltzman
+
+[Install]
+WantedBy=multi-user.target
