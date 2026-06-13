@@ -48,6 +48,9 @@ DEFAULTS = {
     "CLAUDE_MAX_BUDGET_USD": "1.00",
     "MAX_ATTEMPTS": "3",
     "STATE_FILE": "~/.local/state/qbt-jelly-mover/state.json",
+    # Where per-torrent model trajectory transcripts (<hash>.log) are written.
+    # Empty = same directory as STATE_FILE. Set to "off" to disable.
+    "TRAJECTORY_DIR": "",
     # Only process torrents in this qBittorrent category ("" = all).
     "QBT_CATEGORY": "",
     "CLEANUP_EMPTY_DIRS": "true",
@@ -294,7 +297,12 @@ def build_prompt(name: str, files: list[dict], candidates: dict) -> str:
     return "\n".join(lines)
 
 
-def ask_claude(prompt: str, cfg: dict) -> dict:
+def ask_claude(prompt: str, cfg: dict, trajectory_path: Path | None = None,
+               meta: dict | None = None) -> dict:
+    # stream-json + verbose makes claude emit every turn (thinking, text, tool
+    # calls, tool results) as JSONL, which we render into a per-torrent
+    # trajectory file for observability. The terminal "result" event still
+    # carries the schema-validated structured_output, same as plain json mode.
     cmd = [
         cfg["CLAUDE_BIN"],
         "--model", cfg["CLAUDE_MODEL"],
@@ -306,25 +314,149 @@ def ask_claude(prompt: str, cfg: dict) -> dict:
         "--setting-sources", "",
         "--system-prompt", SYSTEM_PROMPT,
         "--json-schema", json.dumps(PLAN_SCHEMA),
-        "--output-format", "json",
+        "--output-format", "stream-json",
+        "--verbose",
         "--max-budget-usd", cfg["CLAUDE_MAX_BUDGET_USD"],
     ]
     res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                          timeout=int(cfg["CLAUDE_TIMEOUT"]))
+
+    events = []
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # stray non-JSON line; ignore
+
+    # Always persist the trajectory -- including on failure, where it is most
+    # useful for debugging -- before we raise on any error.
+    if trajectory_path is not None:
+        try:
+            write_trajectory(trajectory_path, prompt, events, cfg, meta,
+                             stderr=res.stderr)
+        except OSError as e:
+            log(f"  WARN: could not write trajectory {trajectory_path}: {e}")
+
     if res.returncode != 0:
         raise RuntimeError(f"claude exited {res.returncode}: {res.stderr.strip()[:500]}")
-    out = res.stdout
-    payload = json.loads(out[out.index("{"):out.rindex("}") + 1])
-    if payload.get("is_error"):
-        raise RuntimeError(f"claude reported error: {str(payload.get('result'))[:500]}")
-    plan = payload.get("structured_output")
+    result = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if result is None:
+        raise RuntimeError("claude produced no terminal result event")
+    if result.get("is_error"):
+        raise RuntimeError(f"claude reported error: {str(result.get('result'))[:500]}")
+    plan = result.get("structured_output")
     if not isinstance(plan, dict):
         raise RuntimeError("claude returned no structured_output")
-    cost = payload.get("total_cost_usd")
+    cost = result.get("total_cost_usd")
     log(f"  claude plan: type={plan.get('media_type')} "
         f"confidence={plan.get('confidence')} folder={plan.get('library_folder')!r} "
         f"cost=${cost:.4f}" if cost is not None else f"  claude plan: {plan.get('media_type')}")
     return plan
+
+
+# --------------------------------------------------------------------------
+# Trajectory transcript (per-torrent observability)
+# --------------------------------------------------------------------------
+
+# Tool results (raw web-search dumps) are context, not the model's reasoning;
+# cap them so transcripts stay readable. Thinking/text/tool calls are kept whole.
+TOOL_RESULT_CAP = 2000
+
+
+def trajectory_path_for(torrent_hash: str, cfg: dict) -> Path | None:
+    """Path of the trajectory file for a torrent, or None if disabled."""
+    d = cfg.get("TRAJECTORY_DIR", "").strip()
+    if d.lower() == "off":
+        return None
+    base = Path(d).expanduser() if d else Path(cfg["STATE_FILE"]).expanduser().parent
+    return base / f"{torrent_hash}.log"
+
+
+def _blocks(event: dict) -> list:
+    content = event.get("message", {}).get("content")
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return content or []
+
+
+def write_trajectory(path: Path, prompt: str, events: list, cfg: dict,
+                     meta: dict | None = None, stderr: str = "") -> None:
+    out: list[str] = []
+    w = out.append
+    w("=" * 72)
+    w("qbt-jelly-mover model trajectory")
+    if meta:
+        w(f"torrent : {meta.get('name')}")
+        w(f"hash    : {meta.get('hash')}")
+    w(f"time    : {time.strftime('%Y-%m-%dT%H:%M:%S')}")
+    w(f"model   : {cfg['CLAUDE_MODEL']}")
+    w("=" * 72)
+    w("")
+    w("----- PROMPT (user) -----")
+    w(prompt)
+    w("")
+    w("----- TRAJECTORY -----")
+    for e in events:
+        t = e.get("type")
+        if t == "assistant":
+            for b in _blocks(e):
+                bt = b.get("type")
+                if bt == "thinking":
+                    text = (b.get("thinking") or "").strip()
+                    if text:
+                        w("[thinking]")
+                        w(text)
+                        w("")
+                elif bt == "text":
+                    text = (b.get("text") or "").strip()
+                    if text:
+                        w("[assistant]")
+                        w(text)
+                        w("")
+                elif bt in ("tool_use", "server_tool_use"):
+                    w(f"[tool_use: {b.get('name')}] "
+                      f"{json.dumps(b.get('input', {}), ensure_ascii=False)}")
+                    w("")
+        elif t == "user":
+            for b in _blocks(e):
+                if b.get("type") != "tool_result":
+                    continue
+                c = b.get("content")
+                s = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+                if len(s) > TOOL_RESULT_CAP:
+                    s = s[:TOOL_RESULT_CAP] + f"\n... [truncated {len(s) - TOOL_RESULT_CAP} chars]"
+                flag = " (error)" if b.get("is_error") else ""
+                w(f"[tool_result{flag}]")
+                w(s)
+                w("")
+
+    w("----- RESULT -----")
+    result = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if result is not None:
+        w(f"is_error : {result.get('is_error')}")
+        w(f"cost_usd : {result.get('total_cost_usd')}")
+        w(f"num_turns: {result.get('num_turns')}")
+        so = result.get("structured_output")
+        w("structured_output:")
+        w(json.dumps(so, indent=2, ensure_ascii=False) if so is not None else "(none)")
+        if result.get("is_error"):
+            w("")
+            w("result text:")
+            w(str(result.get("result"))[:2000])
+    else:
+        w("(no terminal result event)")
+        if stderr.strip():
+            w("")
+            w("stderr:")
+            w(stderr.strip()[:2000])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(out))
+    tmp.replace(path)
 
 
 # --------------------------------------------------------------------------
@@ -554,7 +686,8 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
         raise RuntimeError("torrent has no downloaded files")
 
     prompt = build_prompt(name, files, library_candidates(name, cfg))
-    plan = ask_claude(prompt, cfg)
+    plan = ask_claude(prompt, cfg, trajectory_path_for(h, cfg),
+                      meta={"name": name, "hash": h})
     media_type, folder, moves, junk = validate_plan(plan, file_names)
 
     if media_type == "other":

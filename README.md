@@ -32,9 +32,10 @@ leaves behind (and that can be turned off with `CLEANUP_EMPTY_DIRS=false`).
 ## Token efficiency
 
 - Claude is called **once per completed torrent**, never while polling.
-- The call is a single non-agentic turn: no tools (`--tools ""`), no settings
-  or CLAUDE.md loaded (`--setting-sources ""`), a ~40-line replacement system
-  prompt, no session persisted, and `--json-schema` for a validated
+- The call is nearly non-agentic: WebSearch is the only tool offered (used
+  only to confirm an unfamiliar title/year), no settings or CLAUDE.md loaded
+  (`--setting-sources ""` + `--strict-mcp-config`), a ~40-line replacement
+  system prompt, no session persisted, and `--json-schema` for a validated
   structured reply.
 - The prompt contains only the torrent name, its file list, and a locally
   pre-filtered shortlist of existing library folders that share a meaningful
@@ -43,6 +44,24 @@ leaves behind (and that can be turned off with `CLEANUP_EMPTY_DIRS=false`).
 
 Everything else (polling, stopping, validating, moving, removing) is plain
 Python stdlib with no LLM involvement.
+
+## Observability
+
+Each call writes a **trajectory transcript** next to the state file, named for
+the torrent hash (`<STATE_FILE dir>/<hash>.log`, overridable with
+`TRAJECTORY_DIR`). It records the exact prompt the model saw, its thinking,
+any web searches it ran, its final answer, and the validated plan plus cost:
+
+```sh
+# review how a given torrent was handled
+less ~/.local/state/qbt-jelly-mover/<hash>.log
+# or, find the hash by name from the state file
+python3 -c 'import json;print("\n".join(f"{h}  {e[\"name\"]}" for h,e in json.load(open(__import__("os").path.expanduser("~/.local/state/qbt-jelly-mover/state.json"))).items()))'
+```
+
+The file is rewritten each time that torrent is (re)processed, so it always
+reflects the latest run -- including failures, where the transcript is the
+quickest way to see what the model did. Set `TRAJECTORY_DIR=off` to disable.
 
 ## Setup
 
@@ -84,6 +103,7 @@ See `env.example` for all settings. Notable:
 | `RECYCLE_DIR` | Junk files are moved here (per-torrent subfolders), never deleted. Empty = `<LOCAL_DOWNLOADS_DIR>/.recycle`, which keeps junk moves on the same NFS export (instant renames). |
 | `QBT_CATEGORY` | Only process torrents in this category. Empty = all. |
 | `MAX_ATTEMPTS` | After this many failures a torrent is parked; delete its entry from `STATE_FILE` to retry. |
+| `TRAJECTORY_DIR` | Where per-torrent `<hash>.log` transcripts go. Empty = alongside `STATE_FILE`; `off` = disable. |
 
 `test.env` (gitignored, see `env.example` for shape) points the library at a
 scratch directory on the VM for safe end-to-end testing against the real
