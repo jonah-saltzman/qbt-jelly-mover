@@ -286,7 +286,8 @@ def build_prompt(name: str, files: list[dict], candidates: dict) -> str:
         lines.append(f"{f['name']} ({size_mb:.0f} MB)")
     if len(files) > 400:
         lines.append(f"... and {len(files) - 400} more files")
-    lines.append("Existing library folders (possible matches):")
+    lines.append("Existing library folders (possible matches; each is prefixed "
+                 "with its [media_type], which is NOT part of the folder name):")
     any_match = False
     for label, names in candidates.items():
         for n in names:
@@ -295,6 +296,28 @@ def build_prompt(name: str, files: list[dict], candidates: dict) -> str:
     if not any_match:
         lines.append("(none)")
     return "\n".join(lines)
+
+
+def deannotate_folder(plan: dict, candidates: dict[str, list[str]]) -> None:
+    """Undo the "[media_type] " annotation build_prompt adds to existing folders.
+
+    The model is meant to return the bare folder name, but it occasionally
+    echoes the annotated string (e.g. "[tv] How I Met Your Mother (2005)")
+    verbatim into library_folder/existing, which would spawn a spurious
+    "[tv] ..." library folder instead of merging into the real one. We only
+    rewrite values that exactly equal a string we generated, so genuinely
+    bracketed folder names (e.g. "[DB]FLCL ...") are never touched. A matched
+    `existing` folder is authoritative for the destination."""
+    real_names = {n for names in candidates.values() for n in names}
+    annotated = {f"[{label}] {n}": n
+                 for label, names in candidates.items() for n in names}
+    for key in ("library_folder", "existing"):
+        val = plan.get(key)
+        if isinstance(val, str) and val in annotated:
+            plan[key] = annotated[val]
+    existing = plan.get("existing")
+    if isinstance(existing, str) and existing in real_names:
+        plan["library_folder"] = existing
 
 
 def ask_claude(prompt: str, cfg: dict, trajectory_path: Path | None = None,
@@ -685,9 +708,11 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
     if not file_names:
         raise RuntimeError("torrent has no downloaded files")
 
-    prompt = build_prompt(name, files, library_candidates(name, cfg))
+    candidates = library_candidates(name, cfg)
+    prompt = build_prompt(name, files, candidates)
     plan = ask_claude(prompt, cfg, trajectory_path_for(h, cfg),
                       meta={"name": name, "hash": h})
+    deannotate_folder(plan, candidates)
     media_type, folder, moves, junk = validate_plan(plan, file_names)
 
     if media_type == "other":
