@@ -102,7 +102,7 @@ See `env.example` for all settings. Notable:
 | `NEEDS_REVIEW_DIR` | Destination for low-confidence media. Empty = leave in downloads and mark failed. |
 | `RECYCLE_DIR` | Junk files are moved here (per-torrent subfolders), never deleted. Empty = `<LOCAL_DOWNLOADS_DIR>/.recycle`, which keeps junk moves on the same NFS export (instant renames). |
 | `QBT_CATEGORY` | Only process torrents in this category. Empty = all. |
-| `MAX_ATTEMPTS` | After this many failures a torrent is parked; delete its entry from `STATE_FILE` to retry. |
+| `RETRY_BASE_DELAY_SEC` / `RETRY_MAX_DELAY_SEC` | Failed torrents are retried forever with exponential backoff (base delay, doubling each attempt, capped at max). Delete a torrent's entry from `STATE_FILE` to force an immediate retry. |
 | `TRAJECTORY_DIR` | Where per-torrent `<hash>.log` transcripts go. Empty = alongside `STATE_FILE`; `off` = disable. |
 
 `test.env` (gitignored, see `env.example` for shape) points the library at a
@@ -117,7 +117,8 @@ qBittorrent instance: `./mover.py --env test.env --once`.
   on the NAS itself), moves become instant server-side renames.
 - State lives in `STATE_FILE` keyed by torrent hash, so the daemon never
   re-asks Claude about a torrent it already classified (`skipped` /
-  `needs_review` / parked-failed torrents stay in qBittorrent without
-  burning tokens each poll).
+  `needs_review` torrents stay in qBittorrent without burning tokens each
+  poll; `failed` torrents are retried with backoff -- see `RETRY_BASE_DELAY_SEC`
+  / `RETRY_MAX_DELAY_SEC` above).
 - qBittorrent v5 API-key auth (`Authorization: Bearer`) is assumed; the
   stop call falls back to v4's `pause` automatically.

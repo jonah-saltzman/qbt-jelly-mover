@@ -46,7 +46,11 @@ DEFAULTS = {
     "CLAUDE_MODEL": "sonnet",
     "CLAUDE_TIMEOUT": "180",
     "CLAUDE_MAX_BUDGET_USD": "1.00",
-    "MAX_ATTEMPTS": "3",
+    # Retry backoff for failed torrents: base delay before the 1st retry,
+    # doubling each subsequent attempt, capped at the max. Failed torrents
+    # are retried forever (never permanently given up on).
+    "RETRY_BASE_DELAY_SEC": "300",
+    "RETRY_MAX_DELAY_SEC": "21600",
     "STATE_FILE": "~/.local/state/qbt-jelly-mover/state.json",
     # Where per-torrent model trajectory transcripts (<hash>.log) are written.
     # Empty = same directory as STATE_FILE. Set to "off" to disable.
@@ -163,6 +167,23 @@ class State:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=1))
         tmp.replace(self.path)
+
+
+def parse_ts(s: str) -> float:
+    return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+
+
+def retry_delay(attempts: int, cfg: dict) -> int:
+    """Exponential backoff before retrying a failed torrent, in seconds."""
+    base = int(cfg["RETRY_BASE_DELAY_SEC"])
+    cap = int(cfg["RETRY_MAX_DELAY_SEC"])
+    return min(base * (2 ** max(attempts - 1, 0)), cap)
+
+
+def fmt_delay(seconds: int) -> str:
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds / 3600:.1f}h"
 
 
 # --------------------------------------------------------------------------
@@ -742,6 +763,9 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
 def poll_once(qbt: Qbt, state: State, cfg: dict, dry_run: bool) -> None:
     for t in qbt.completed(cfg["QBT_CATEGORY"]):
         h = t["hash"]
+        tags = {tag.strip() for tag in t.get("tags", "").split(",")}
+        if "noclaude" in tags:
+            continue
         entry = state.get(h)
         if entry and entry.get("added_on") != t.get("added_on"):
             # Same hash, new download (torrent was re-added): start over.
@@ -756,21 +780,26 @@ def poll_once(qbt: Qbt, state: State, cfg: dict, dry_run: bool) -> None:
             continue
         if entry.get("status") in ("skipped", "needs_review"):
             continue
-        attempts = entry.get("attempts", 0)
-        if entry.get("status") == "failed" and attempts >= int(cfg["MAX_ATTEMPTS"]):
-            continue
+        if entry.get("status") == "failed":
+            delay = retry_delay(entry.get("attempts", 0), cfg)
+            last_updated = entry.get("updated")
+            if last_updated:
+                try:
+                    due = time.time() - parse_ts(last_updated) >= delay
+                except ValueError:
+                    due = True  # unparsable timestamp: don't get stuck
+                if not due:
+                    continue
         if t["progress"] < 1 or t["state"] in UNSTABLE_STATES:
             continue
         try:
             process_torrent(t, qbt, state, cfg, dry_run)
         except Exception as e:  # noqa: BLE001 -- keep the daemon alive
-            attempts += 1
-            log(f"  ERROR ({attempts}/{cfg['MAX_ATTEMPTS']}): {e}")
+            attempts = entry.get("attempts", 0) + 1
+            delay = retry_delay(attempts, cfg)
+            log(f"  ERROR (attempt {attempts}): {e}; retrying in ~{fmt_delay(delay)}")
             state.set(h, status="failed", name=t["name"], added_on=t.get("added_on"),
                       attempts=attempts, error=str(e)[:300])
-            if attempts >= int(cfg["MAX_ATTEMPTS"]):
-                log(f"  giving up on {t['name']!r}; will not retry "
-                    f"(delete its state entry to retry)")
 
 
 def main() -> None:
