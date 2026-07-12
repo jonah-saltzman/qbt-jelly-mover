@@ -223,6 +223,15 @@ Rules:
     "Season 01/Title S01E01 Episode Name.ext". For lecture series/courses,
     number the lectures in their natural order as S01E01, S01E02, ...
     Subtitles are named like their episode.
+  - "Subtitle groups" listed under Files are a single directory of many
+    per-language subtitle files for one episode/movie. Move the whole group
+    with ONE moves entry instead of listing its files individually: "from"
+    is the group's path verbatim (ending in "/"), "to" is the "to" of the
+    video file these subtitles belong to, copied VERBATIM from that video's
+    moves entry (Jellyfin only finds subtitles sitting next to the video and
+    named after it; the mover renames each file to "Video Name.<lang>.srt"
+    automatically). Never use a directory as a group's "to", and do not list
+    a subtitle group's individual files anywhere in "moves" or "junk".
 - For media_type "other": library_folder is "" and moves is []; junk stays [].
 - confidence: "low" if unsure about the classification or the naming,
   otherwise "high".
@@ -300,13 +309,52 @@ def library_candidates(torrent_name: str, cfg: dict) -> dict[str, list[str]]:
     return out
 
 
-def build_prompt(name: str, files: list[dict], candidates: dict) -> str:
+SUBTITLE_EXTS = {"srt", "ass", "ssa", "sub", "vtt"}
+SUBTITLE_GROUP_MIN = 8  # a directory with >= this many subtitle files is grouped
+
+
+def group_subtitle_dirs(files: list[dict]) -> tuple[list[dict], dict[str, list[dict]]]:
+    """Bulk per-language subtitle packs (20-30 .srt files in one directory,
+    one such directory per episode) blow up the prompt/output enough to
+    exceed CLAUDE_TIMEOUT if listed file-by-file. Collapse each such
+    directory into a single prompt line so Claude can move the whole group
+    with one {from, to} entry instead of one per language file -- see
+    validate_plan, which expands the group into per-file moves placed next
+    to the episode's video file as "Video Name.<lang>.<ext>" (the only
+    layout Jellyfin discovers external subtitles from). Returns (files to
+    list individually, groups keyed by the synthetic "dir/" from-path)."""
+    by_dir: dict[str, list[dict]] = {}
+    for f in files:
+        name = f["name"]
+        ext = name.rpartition(".")[2].lower()
+        if ext in SUBTITLE_EXTS:
+            d = name.rsplit("/", 1)[0] if "/" in name else ""
+            by_dir.setdefault(d, []).append(f)
+    groups = {f"{d}/": members for d, members in by_dir.items()
+             if len(members) >= SUBTITLE_GROUP_MIN}
+    grouped_names = {f["name"] for members in groups.values() for f in members}
+    remaining = [f for f in files if f["name"] not in grouped_names]
+    return remaining, groups
+
+
+def build_prompt(name: str, files: list[dict], groups: dict[str, list[dict]],
+                 candidates: dict) -> str:
     lines = [f"Torrent: {name}", "Files:"]
     for f in files[:400]:
         size_mb = f["size"] / 1e6
         lines.append(f"{f['name']} ({size_mb:.0f} MB)")
     if len(files) > 400:
         lines.append(f"... and {len(files) - 400} more files")
+    if groups:
+        lines.append("")
+        lines.append("Subtitle groups (bulk multi-language packs; see 'moves' "
+                     "rules for how to move one as a single unit):")
+        for d, members in groups.items():
+            total_mb = sum(f["size"] for f in members) / 1e6
+            sample = ", ".join(sorted(f["name"].rsplit("/", 1)[-1]
+                                      for f in members)[:5])
+            lines.append(f"{d} ({len(members)} subtitle files, "
+                         f"{total_mb:.0f} MB total, e.g. {sample}, ...)")
     lines.append("Existing library folders (possible matches; each is prefixed "
                  "with its [media_type], which is NOT part of the folder name):")
     any_match = False
@@ -542,11 +590,63 @@ def common_root(file_names: list[str]) -> str:
 JUNK_EXTS = {"txt", "nfo", "url", "lnk", "exe", "sfv", "srr", "md5", "sha",
              "sha1", "sha256", "torrent", "htm", "html", "website"}
 
+# Language names seen in bulk subtitle packs -> tags Jellyfin parses. Keys are
+# lowercased with punctuation collapsed to single spaces ("Portuguese
+# (Brazilian)" and "Brazilian.Portuguese" both hit "portuguese brazilian" /
+# "brazilian portuguese"). ISO codes ("en", "eng", "pt-BR") need no entry:
+# they pass through verbatim and Jellyfin already parses them.
+SUBTITLE_LANGS = {
+    "arabic": "ar", "bulgarian": "bg", "catalan": "ca", "chinese": "zh",
+    "simplified chinese": "zh-Hans", "chinese simplified": "zh-Hans",
+    "traditional chinese": "zh-Hant", "chinese traditional": "zh-Hant",
+    "croatian": "hr", "czech": "cs", "danish": "da", "dutch": "nl",
+    "english": "en", "estonian": "et", "filipino": "fil", "finnish": "fi",
+    "french": "fr", "german": "de", "greek": "el", "hebrew": "he",
+    "hindi": "hi", "hungarian": "hu", "indonesian": "id", "italian": "it",
+    "japanese": "ja", "korean": "ko", "latvian": "lv", "lithuanian": "lt",
+    "malay": "ms", "may": "ms", "norwegian": "no", "bokmal": "nb",
+    "norwegian bokmal": "nb", "persian": "fa", "farsi": "fa",
+    "polish": "pl", "portuguese": "pt",
+    "brazilian portuguese": "pt-BR", "portuguese brazilian": "pt-BR",
+    "european portuguese": "pt-PT", "portuguese european": "pt-PT",
+    "romanian": "ro", "russian": "ru", "serbian": "sr", "slovak": "sk",
+    "slovenian": "sl", "spanish": "es",
+    "latin american spanish": "es-419", "spanish latin american": "es-419",
+    "european spanish": "es-ES", "spanish european": "es-ES",
+    "castilian": "es-ES", "swedish": "sv", "tagalog": "tl", "thai": "th",
+    "turkish": "tr", "ukrainian": "uk", "vietnamese": "vi",
+}
 
-def validate_plan(plan: dict, file_names: list[str]
+# Trailing modifiers Jellyfin recognizes as stream flags ("English [SDH]" ->
+# "en.sdh"). "hi" is deliberately absent: it collides with Hindi's ISO code.
+SUBTITLE_FLAGS = {"sdh", "cc", "forced", "default"}
+
+
+def subtitle_token(filename: str) -> str:
+    """Suffix for a grouped subtitle landing next to its video as
+    "Video Name.<token>.<ext>". Bulk packs name files like "12_English.srt"
+    or "9_English [SDH].srt": strip the index, map the language name to a
+    tag Jellyfin parses, keep recognized trailing flags. Unmapped names are
+    kept as-is -- Jellyfin shows an unrecognized token as the subtitle
+    track's title, which is still selectable in the player."""
+    stem = filename.rpartition(".")[0] or filename
+    s = re.sub(r"^\d+[ _.\-]*", "", stem) or stem
+    words = re.sub(r"[^0-9A-Za-z]+", " ", s).lower().split()
+    flags = []
+    while len(words) > 1 and words[-1] in SUBTITLE_FLAGS:
+        flags.insert(0, words.pop())
+    lang = SUBTITLE_LANGS.get(" ".join(words))
+    if lang:
+        return ".".join([lang] + flags)
+    return sanitize_component(s) or sanitize_component(stem) or "und"
+
+
+def validate_plan(plan: dict, file_names: list[str],
+                  groups: dict[str, list[dict]] | None = None
                   ) -> tuple[str, str, list[tuple[str, str]], list[tuple[str, str]]]:
     """Returns (media_type, library_folder, moves, junk) where moves and junk
     are [(from, to), ...] lists. Raises ValueError."""
+    groups = groups or {}
     media_type = plan["media_type"]
     if media_type == "other":
         return media_type, "", [], []
@@ -570,9 +670,12 @@ def validate_plan(plan: dict, file_names: list[str]
         seen_from.add(src)
         junk.append((src, sanitize_relpath(below_root(src))))
 
-    seen_to, moves = set(), []
+    seen_to, moves, group_moves = set(), [], []
     for m in plan["moves"]:
         src = m["from"]
+        if src in groups:
+            group_moves.append(m)
+            continue
         if src not in known:
             raise ValueError(f"plan references unknown file: {src!r}")
         if src in seen_from:
@@ -583,6 +686,44 @@ def validate_plan(plan: dict, file_names: list[str]
             raise ValueError(f"duplicate destination: {dst!r}")
         seen_to.add(dst.lower())
         moves.append((src, dst))
+
+    # Subtitle groups expand after the regular moves: a group's "to" names the
+    # destination of the video file it subtitles (with or without extension),
+    # and each member lands next to that video as "Video Name.<token>.<ext>"
+    # -- the only layout Jellyfin discovers external subtitles from.
+    if group_moves:
+        video_dest: dict[str, str] = {}
+        for _, dst in moves:
+            video_dest[dst.lower()] = dst
+            video_dest.setdefault(dst.rsplit(".", 1)[0].lower(), dst)
+        for m in group_moves:
+            src = m["from"]
+            target = video_dest.get(sanitize_relpath(m["to"]).lower())
+            if target is None:
+                raise ValueError(
+                    f"subtitle group {src!r}: to={m['to']!r} does not match "
+                    "the destination of any video file in moves")
+            base = target.rsplit(".", 1)[0]
+            members = groups[src]
+            tokens = [subtitle_token(gf["name"].rsplit("/", 1)[-1])
+                      for gf in members]
+            counts: dict[str, int] = {}
+            for tok in tokens:
+                counts[tok.lower()] = counts.get(tok.lower(), 0) + 1
+            for gf, token in zip(members, tokens):
+                gsrc = gf["name"]
+                if gsrc in seen_from:
+                    raise ValueError(f"file listed twice: {gsrc!r}")
+                seen_from.add(gsrc)
+                stem, _, ext = gsrc.rsplit("/", 1)[-1].rpartition(".")
+                if counts[token.lower()] > 1:  # e.g. two "English" variants
+                    token = sanitize_component(stem) or token
+                gdst, n = f"{base}.{token}.{ext.lower()}", 2
+                while gdst.lower() in seen_to:
+                    gdst = f"{base}.{token}.{n}.{ext.lower()}"
+                    n += 1
+                seen_to.add(gdst.lower())
+                moves.append((gsrc, gdst))
 
     # Anything Claude forgot still has to leave the downloads folder: junk
     # extensions go to the recycle bin, anything else is stashed in extras/.
@@ -729,12 +870,17 @@ def process_torrent(t: dict, qbt: Qbt, state: State, cfg: dict, dry_run: bool) -
     if not file_names:
         raise RuntimeError("torrent has no downloaded files")
 
+    prompt_files, groups = group_subtitle_dirs(files)
+    if groups:
+        log(f"  grouped {sum(len(m) for m in groups.values())} subtitle "
+            f"file(s) into {len(groups)} bulk-pack director{'y' if len(groups) == 1 else 'ies'}")
+
     candidates = library_candidates(name, cfg)
-    prompt = build_prompt(name, files, candidates)
+    prompt = build_prompt(name, prompt_files, groups, candidates)
     plan = ask_claude(prompt, cfg, trajectory_path_for(h, cfg),
                       meta={"name": name, "hash": h})
     deannotate_folder(plan, candidates)
-    media_type, folder, moves, junk = validate_plan(plan, file_names)
+    media_type, folder, moves, junk = validate_plan(plan, file_names, groups=groups)
 
     if media_type == "other":
         log("  not movie/tv content; leaving torrent stopped in qBittorrent")
