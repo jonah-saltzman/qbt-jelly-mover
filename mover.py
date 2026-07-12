@@ -46,6 +46,9 @@ DEFAULTS = {
     "CLAUDE_MODEL": "sonnet",
     "CLAUDE_TIMEOUT": "180",
     "CLAUDE_MAX_BUDGET_USD": "1.00",
+    # API key for the claude CLI. Empty = whatever auth the CLI already has
+    # (subscription login), but that login expires; an API key does not.
+    "ANTHROPIC_API_KEY": "",
     # Retry backoff for failed torrents: base delay before the 1st retry,
     # doubling each subsequent attempt, capped at the max. Failed torrents
     # are retried forever (never permanently given up on).
@@ -410,8 +413,11 @@ def ask_claude(prompt: str, cfg: dict, trajectory_path: Path | None = None,
         "--verbose",
         "--max-budget-usd", cfg["CLAUDE_MAX_BUDGET_USD"],
     ]
+    env = os.environ.copy()
+    if cfg.get("ANTHROPIC_API_KEY"):
+        env["ANTHROPIC_API_KEY"] = cfg["ANTHROPIC_API_KEY"]
     res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                         timeout=int(cfg["CLAUDE_TIMEOUT"]))
+                         timeout=int(cfg["CLAUDE_TIMEOUT"]), env=env)
 
     events = []
     for line in res.stdout.splitlines():
